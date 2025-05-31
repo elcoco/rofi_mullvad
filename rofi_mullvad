@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+from typing import Optional
+import subprocess
+import os
+from pathlib import Path
+import logging
+import argparse
+
+DISABLE_ALL_STR = "Disable All"
+
+""" Script assumes that the wireguard profile names begin with a country code.
+    This is the case with the mullvad profiles. """
+
+
+class MullvadException(Exception): pass
+
+
+class CustomFormatter(logging.Formatter):
+    """Logging Formatter to add colors and count warning / errors"""
+
+    format = "%(message)s"
+
+    FORMATS = {
+        logging.DEBUG: f"{format}",
+        logging.INFO: f"{format}",
+        logging.WARNING: f"{format}",
+        logging.ERROR: f"{format}",
+        logging.CRITICAL: f"{format}",
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+
+class Rofi():
+    """ Class for building rofi apps
+          add()   will accept a list or a string, you can call this method
+                  multiple times and the result will be added to the rofi args
+          show()  show rofi, return result
+          sort()  Sorts rofi args in alphabetic order
+          reset() is called by show() and resets the rofi args
+
+          It will look for a rofi config file in ~/.config/rofi """
+
+    def __init__(self, theme: str="glue_pro_blue"):
+        self.lines = []
+        self._rofi_cmd = ["rofi", "-dmenu"]
+        self._theme = theme
+        self._width = 20
+
+    def sanitize(self, data, extra_opts = []):
+        sanitize_list = [' ', '\'', '\"', '\n'] + extra_opts
+        for sanitize in sanitize_list:
+            data = data.strip(sanitize)
+        return data
+
+    def is_installed(self, application):
+        try:
+            subprocess.call(application, stdout=subprocess.PIPE)
+            return True
+        except OSError as e:
+            pass
+
+    def run_cmd(self, cmd, lines):
+        try:
+            child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            return child.communicate(lines)[0]
+        except FileNotFoundError:
+            logger.error(f"Failed to run Rofi")
+
+    def show(self, prompt=False):
+        if not self.is_installed(["rofi", "-v"]):
+            logger.error("ERROR: Rofi is not installed")
+            return
+
+        cmd = self._rofi_cmd
+
+        if self._theme:
+            cmd += ["-theme", self._theme]
+
+        cmd += ["-p", prompt or ""]
+
+        lines = [str(line) for line in self.lines]
+        lines_string = '\n'.join(lines).encode("utf-8")
+
+        result = self.run_cmd(cmd, lines_string)
+        result = result.decode('utf-8')
+        return result.strip()
+
+    def sort(self):
+        self.lines = sorted(self.lines)
+
+    def add(self, line):
+        if type(line) is list or type(line) is tuple:
+            self.lines += line
+        else:
+            self.lines.append(line)
+
+    def add_divider(self, length=None, char="-", text: str=""):
+        length = self._width if length == None else length
+
+        if text:
+            dev_len = int((length-(len(text)+2))/2)
+            txt = f"{char*dev_len} {text} "
+            self.add(txt + char * (length-len(txt)))
+        else:
+            self.add(length*char)
+
+
+class History():
+    def __init__(self, path: Path, limit: int=5):
+        self._history = []
+        self._path = path
+        self._limit = limit
+
+    def read(self):
+        if self._path.is_file():
+            return self._path.read_text().split("\n")
+        return []
+
+    def write(self, item: str):
+        history = self.read()
+        if item in history:
+            # Item is already in history so we're moving it to the top
+            history.remove(item)
+
+        history.append(item)
+        self._path.parent.mkdir(exist_ok=True)
+        self._path.write_text("\n".join(history[-self._limit:]))
+
+
+class Wireguard():
+    def run_cmd(self, cmd: list[str], timeout: int=-1, user: Optional[str]=None, envs: Optional[dict[str,str]]=None, cwd: Optional[Path]=None, raise_on_err=True, shell: bool=False):
+        # this fixes all sort of localisation issues like ',' for '.' in numbers
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+
+        if envs:
+            for k,v in envs.items():
+                env[k] = v
+
+        if user:
+            cmd = ["sudo", "-u", user] + cmd
+
+        # raises FileNotFoundError if command is not found
+        try:
+            if timeout > 0:
+                result = subprocess.run(cmd, capture_output=True, encoding="utf8", env=env, cwd=cwd, timeout=timeout, shell=shell)
+            else:
+                result = subprocess.run(cmd, capture_output=True, encoding="utf8", env=env, cwd=cwd, shell=shell)
+
+        except subprocess.TimeoutExpired as e:
+            raise MullvadException(e)
+        except FileNotFoundError as e:
+            raise MullvadException(e)
+
+        # raises subprocess.CalledProcessError if exitcode is not 0
+        try:
+            result.check_returncode()
+        except subprocess.CalledProcessError as e:
+            logger.debug(result.stdout)
+            logger.debug(result.stderr)
+            if raise_on_err:
+                raise MullvadException(e)
+
+        return result
+
+    def group_confs(self, confs: list[str]) -> dict[str,list[str]]:
+        """ Group list into dictionaries by country code """
+        groups = {}
+        for x in confs:
+            country = "" # silence linter, unbound blablabla
+            try:
+                country = x.split("-")[0]
+            except IndexError:
+                raise MullvadException(f"Failed to get country from config: {x}")
+
+            if not country in groups.keys():
+                groups[country] = []
+            groups[country].append(x)
+
+        groups_sorted = {}
+        for k in sorted(groups.keys()):
+            groups_sorted[k] = sorted(groups[k])
+
+        return groups_sorted
+
+    def get_profiles(self) -> dict[str,list[str]]:
+        res = self.run_cmd(["nmcli", "connection", "show"])
+        wg_confs = [l.split(" ")[0] for l in res.stdout.split("\n") if "wireguard" in l]
+        return self.group_confs(wg_confs)
+
+    def get_active_profiles(self):
+        res = self.run_cmd(["nmcli", "connection", "show", "--active"])
+        return [l.split(" ")[0] for l in res.stdout.split("\n") if "wireguard" in l]
+
+    def disable_profile(self, profile: str):
+        self.run_cmd(["nmcli", "connection", "down", profile])
+        logger.info(f"Deactivated profile: {profile}")
+
+    def disable_all_active_profiles(self, whitelist: Optional[list[str]]=None):
+        for active in self.get_active_profiles():
+            if not whitelist or not active in whitelist:
+                self.disable_profile(active)
+
+    def enable_profile(self, profile: str):
+        """ Enable new connection, disable previous connection """
+        self.run_cmd(["nmcli", "connection", "up", profile])
+        logger.info(f"Activated profile: {profile}")
+
+
+class App(Wireguard):
+    def __init__(self) -> None:
+        self.parse_args()
+        self._history = History(self._path_history, self._max_history)
+
+    def parse_args(self):
+        parser = argparse.ArgumentParser(description="Manage wireguard connections")
+        parser.add_argument('-t', '--rofi-theme', help="Rofi theme, default=glue_pro_blue", metavar="THEME", type=str, default="glue_pro_blue")
+        parser.add_argument('-H', '--history-path', help="Path to history file, default=~/.config/rofi_wireguard.history", metavar="FILE", type=Path, default=Path.home() / ".config/rofi_wireguard.history")
+        parser.add_argument('-m', '--max-history', help="Maximum amount of history items, default=5", metavar="AMOUNT", type=int, default=5)
+        parser.add_argument('-D', '--debug', help="Enable debugging", action='store_true')
+        args = parser.parse_args()
+
+        self._rofi_theme = args.rofi_theme
+        self._path_history = args.history_path
+        self._max_history = args.max_history
+
+        if args.debug:
+            logger.setLevel(logging.DEBUG)
+        else:
+            logger.setLevel(logging.INFO)
+
+    def add_history(self, rofi: Rofi):
+        """ Add history to rofi """
+        if hist := list(reversed(self._history.read())):
+            rofi.add_divider(text="history")
+            rofi.add(hist)
+            rofi.add_divider()
+
+    def add_active(self, rofi: Rofi):
+        """ Add active profiles to rofi """
+        if profiles := self.get_active_profiles():
+            for profile in profiles:
+                rofi.add(f"Active: {profile}")
+        else:
+            rofi.add(f"No active profiles")
+
+    def select_profile(self, profiles):
+        """ Select profile using rofi """
+        rofi = Rofi(theme=self._rofi_theme)
+        rofi.add(profiles)
+
+        selected_profile = rofi.show()
+        if not selected_profile or not selected_profile in profiles:
+            logger.debug("no match")
+            return
+        return selected_profile
+
+    def handle_selected(self, profile: str):
+        """ !! First activate and then deactivate all other """
+        self.enable_profile(profile)
+        self.disable_all_active_profiles(whitelist=[profile])
+        self._history.write(profile)
+
+    def run(self):
+        wg_confs = self.get_profiles()
+
+        while True:
+            rofi = Rofi(theme=self._rofi_theme)
+
+            self.add_active(rofi)
+            rofi.add(DISABLE_ALL_STR)
+            self.add_history(rofi)
+            rofi.add(list(wg_confs.keys())) # Add countries
+
+            if not (res := rofi.show()):
+                return
+
+            if res == DISABLE_ALL_STR:
+                self.disable_all_active_profiles()
+                return
+            elif res in self._history.read():
+                self.handle_selected(res)
+                break
+            elif res in wg_confs.keys():
+                if selected_profile := self.select_profile(wg_confs[res]):
+                    self.handle_selected(selected_profile)
+                    break
+
+
+logger = logging.getLogger("rofi_wireguard")
+ch = logging.StreamHandler()
+ch.setFormatter(CustomFormatter())
+logger.addHandler(ch)
+
+if __name__ == "__main__":
+    app = App()
+    try:
+        app.run()
+    except MullvadException as e:
+        logger.error(e)
