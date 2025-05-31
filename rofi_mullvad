@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
-from typing import Optional
+from typing import Optional, Any
 import subprocess
 import os
 from pathlib import Path
 import logging
 import argparse
+import json
 
 DISABLE_ALL_STR = "Disable All"
 
@@ -35,6 +36,12 @@ class CustomFormatter(logging.Formatter):
         return formatter.format(record)
 
 
+class RofiLine():
+    def __init__(self, name: str, target: Any) -> None:
+        self.name = name
+        self.target = target
+
+
 class Rofi():
     """ Class for building rofi apps
           add()   will accept a list or a string, you can call this method
@@ -47,7 +54,7 @@ class Rofi():
 
     def __init__(self, theme: str="glue_pro_blue"):
         self.lines = []
-        self._rofi_cmd = ["rofi", "-dmenu"]
+        self._rofi_cmd = ["rofi", "-dmenu", "-i"]
         self._theme = theme
         self._width = 20
 
@@ -71,6 +78,10 @@ class Rofi():
         except FileNotFoundError:
             logger.error(f"Failed to run Rofi")
 
+    def lookup(self, name: str):
+        """ Find a line in lines that corresponds with given line """
+        return next((l.target for l in self.lines if l.name == name), None)
+
     def show(self, prompt=False):
         if not self.is_installed(["rofi", "-v"]):
             logger.error("ERROR: Rofi is not installed")
@@ -83,21 +94,24 @@ class Rofi():
 
         cmd += ["-p", prompt or ""]
 
-        lines = [str(line) for line in self.lines]
+        lines = [str(line.name) for line in self.lines]
         lines_string = '\n'.join(lines).encode("utf-8")
 
         result = self.run_cmd(cmd, lines_string)
-        result = result.decode('utf-8')
-        return result.strip()
+        result = result.decode('utf-8').strip()
+
+        # Fine corresponding line object
+        return self.lookup(result) or result
 
     def sort(self):
         self.lines = sorted(self.lines)
 
-    def add(self, line):
-        if type(line) is list or type(line) is tuple:
-            self.lines += line
-        else:
-            self.lines.append(line)
+    def add(self, name: str, target: Any):
+        self.lines.append(RofiLine(name, target))
+        #if type(line) is list or type(line) is tuple:
+        #    self.lines += line
+        #else:
+        #    self.lines.append(line)
 
     def add_divider(self, length=None, char="-", text: str=""):
         length = self._width if length == None else length
@@ -105,9 +119,11 @@ class Rofi():
         if text:
             dev_len = int((length-(len(text)+2))/2)
             txt = f"{char*dev_len} {text} "
-            self.add(txt + char * (length-len(txt)))
+            #self.add(txt + char * (length-len(txt)))
+            self.add(txt + char * (length-len(txt)), None)
         else:
-            self.add(length*char)
+            #self.add(length*char)
+            self.add(length*char, None)
 
 
 class History():
@@ -216,6 +232,7 @@ class App(Wireguard):
     def __init__(self) -> None:
         self.parse_args()
         self._history = History(self._path_history, self._max_history)
+        self._path_country_codes = Path(os.path.dirname(__file__)) / "country_codes.json"
 
     def parse_args(self):
         parser = argparse.ArgumentParser(description="Manage wireguard connections")
@@ -238,21 +255,25 @@ class App(Wireguard):
         """ Add history to rofi """
         if hist := list(reversed(self._history.read())):
             rofi.add_divider(text="history")
-            rofi.add(hist)
+            #rofi.add(hist)
+            for h in hist:
+                rofi.add(h, h)
             rofi.add_divider()
 
     def add_active(self, rofi: Rofi):
         """ Add active profiles to rofi """
         if profiles := self.get_active_profiles():
             for profile in profiles:
-                rofi.add(f"Active: {profile}")
+                rofi.add(f"Active: {profile}", None)
         else:
-            rofi.add(f"No active profiles")
+            rofi.add(f"No active profiles", None)
 
     def select_profile(self, profiles):
         """ Select profile using rofi """
         rofi = Rofi(theme=self._rofi_theme)
-        rofi.add(profiles)
+        #rofi.add(profiles)
+        for p in profiles:
+            rofi.add(p, p)
 
         selected_profile = rofi.show()
         if not selected_profile or not selected_profile in profiles:
@@ -266,16 +287,28 @@ class App(Wireguard):
         self.disable_all_active_profiles(whitelist=[profile])
         self._history.write(profile)
 
+    def parse_profile(self, name: str):
+        try:
+            country, city, protocol, n = name.split("-")
+            return f"[{n}] {country} - {city}"
+        except ValueError:
+            print(name)
+            pass
+        
+
     def run(self):
         wg_confs = self.get_profiles()
+        country_map = json.loads(self._path_country_codes.read_text())
 
         while True:
             rofi = Rofi(theme=self._rofi_theme)
 
             self.add_active(rofi)
-            rofi.add(DISABLE_ALL_STR)
+            rofi.add(DISABLE_ALL_STR, DISABLE_ALL_STR)
             self.add_history(rofi)
-            rofi.add(list(wg_confs.keys())) # Add countries
+
+            for c in wg_confs.keys():
+                rofi.add(country_map.get(c, c), c) 
 
             if not (res := rofi.show()):
                 return
