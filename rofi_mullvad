@@ -268,6 +268,13 @@ class App(Wireguard):
         else:
             rofi.add(f"No active profiles", None)
 
+    def add_countries(self, rofi, countries):
+        country_map = json.loads(self._path_country_codes.read_text())
+        mapped = [[country_map.get(c, c), c] for c in countries]
+        mapped_s = sorted(mapped, key=lambda s: s[0])
+        for name, country in mapped_s:
+            rofi.add(name, country)
+
     def select_profile(self, profiles):
         """ Select profile using rofi """
         rofi = Rofi(theme=self._rofi_theme)
@@ -287,18 +294,8 @@ class App(Wireguard):
         self.disable_all_active_profiles(whitelist=[profile])
         self._history.write(profile)
 
-    def parse_profile(self, name: str):
-        try:
-            country, city, protocol, n = name.split("-")
-            return f"[{n}] {country} - {city}"
-        except ValueError:
-            print(name)
-            pass
-        
-
     def run(self):
         wg_confs = self.get_profiles()
-        country_map = json.loads(self._path_country_codes.read_text())
 
         while True:
             rofi = Rofi(theme=self._rofi_theme)
@@ -306,9 +303,7 @@ class App(Wireguard):
             self.add_active(rofi)
             rofi.add(DISABLE_ALL_STR, DISABLE_ALL_STR)
             self.add_history(rofi)
-
-            for c in wg_confs.keys():
-                rofi.add(country_map.get(c, c), c) 
+            self.add_countries(rofi, wg_confs.keys())
 
             if not (res := rofi.show()):
                 return
