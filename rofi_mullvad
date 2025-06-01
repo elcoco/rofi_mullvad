@@ -53,10 +53,10 @@ class Rofi():
           It will look for a rofi config file in ~/.config/rofi """
 
     def __init__(self, theme: str="glue_pro_blue"):
-        self.lines = []
-        self._rofi_cmd = ["rofi", "-dmenu", "-i"]
+        self._lines = []
+        self._rofi_cmd = ["rofi", "-dmenu", "-i",  "-theme-str", "window {width: 300px; height: 700px;}"]
         self._theme = theme
-        self._width = 20
+        self._div_width = 20
 
     def sanitize(self, data, extra_opts = []):
         sanitize_list = [' ', '\'', '\"', '\n'] + extra_opts
@@ -80,7 +80,7 @@ class Rofi():
 
     def lookup(self, name: str):
         """ Find a line in lines that corresponds with given line """
-        return next((l.target for l in self.lines if l.name == name), None)
+        return next((l.target for l in self._lines if l.name == name), None)
 
     def show(self, prompt=False):
         if not self.is_installed(["rofi", "-v"]):
@@ -94,7 +94,7 @@ class Rofi():
 
         cmd += ["-p", prompt or ""]
 
-        lines = [str(line.name) for line in self.lines]
+        lines = [str(line.name) for line in self._lines]
         lines_string = '\n'.join(lines).encode("utf-8")
 
         result = self.run_cmd(cmd, lines_string)
@@ -104,22 +104,17 @@ class Rofi():
         return self.lookup(result) or result
 
     def sort(self):
-        self.lines = sorted(self.lines)
+        self._lines = sorted(self._lines)
 
     def add(self, name: str, target: Any):
-        self.lines.append(RofiLine(name, target))
-        #if type(line) is list or type(line) is tuple:
-        #    self.lines += line
-        #else:
-        #    self.lines.append(line)
+        self._lines.append(RofiLine(name, target))
 
     def add_divider(self, length=None, char="-", text: str=""):
-        length = self._width if length == None else length
+        length = self._div_width if length == None else length
 
         if text:
             dev_len = int((length-(len(text)+2))/2)
             txt = f"{char*dev_len} {text} "
-            #self.add(txt + char * (length-len(txt)))
             self.add(txt + char * (length-len(txt)), None)
         else:
             #self.add(length*char)
@@ -184,6 +179,14 @@ class Wireguard():
 
         return result
 
+    def notify(self, summary: str, body: str, t_ms: int=10000):
+        if t_ms >= 0:
+            try:
+                self.run_cmd(["notify-send", "--app-name=Mullvad", f"--expire-time={t_ms}",
+                             f"--urgency=normal", f"Mullvad: {summary}", body])
+            except MullvadException as e:
+                logger.error(e)
+
     def group_confs(self, confs: list[str]) -> dict[str,list[str]]:
         """ Group list into dictionaries by country code """
         groups = {}
@@ -216,6 +219,7 @@ class Wireguard():
     def disable_profile(self, profile: str):
         self.run_cmd(["nmcli", "connection", "down", profile])
         logger.info(f"Deactivated profile: {profile}")
+        self.notify("Deactivated profile", profile)
 
     def disable_all_active_profiles(self, whitelist: Optional[list[str]]=None):
         for active in self.get_active_profiles():
@@ -226,6 +230,7 @@ class Wireguard():
         """ Enable new connection, disable previous connection """
         self.run_cmd(["nmcli", "connection", "up", profile])
         logger.info(f"Activated profile: {profile}")
+        self.notify("Activated profile", profile)
 
 
 class App(Wireguard):
@@ -236,15 +241,21 @@ class App(Wireguard):
 
     def parse_args(self):
         parser = argparse.ArgumentParser(description="Manage wireguard connections")
-        parser.add_argument('-t', '--rofi-theme', help="Rofi theme, default=glue_pro_blue", metavar="THEME", type=str, default="glue_pro_blue")
+        parser.add_argument('-t', '--rofi-theme', help="Rofi theme", metavar="THEME", type=str)
         parser.add_argument('-H', '--history-path', help="Path to history file, default=~/.config/rofi_wireguard.history", metavar="FILE", type=Path, default=Path.home() / ".config/rofi_wireguard.history")
         parser.add_argument('-m', '--max-history', help="Maximum amount of history items, default=5", metavar="AMOUNT", type=int, default=5)
+        parser.add_argument('-n', '--notify_ms',  help="duration of notification in sec (-1 to disable), default=10", type=int, default=10)
         parser.add_argument('-D', '--debug', help="Enable debugging", action='store_true')
         args = parser.parse_args()
 
         self._rofi_theme = args.rofi_theme
         self._path_history = args.history_path
         self._max_history = args.max_history
+
+        if args.notify_ms < 0:
+            self._t_notify_ms = -1
+        else:
+            self._t_notify_ms = args.notify_ms * 1000
 
         if args.debug:
             logger.setLevel(logging.DEBUG)
@@ -320,7 +331,7 @@ class App(Wireguard):
                     break
 
 
-logger = logging.getLogger("rofi_wireguard")
+logger = logging.getLogger("rofi_mullvad")
 ch = logging.StreamHandler()
 ch.setFormatter(CustomFormatter())
 logger.addHandler(ch)
