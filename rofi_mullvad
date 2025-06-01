@@ -212,7 +212,7 @@ class Wireguard():
         wg_confs = [l.split(" ")[0] for l in res.stdout.split("\n") if "wireguard" in l]
         return self.group_confs(wg_confs)
 
-    def get_active_profiles(self):
+    def get_enabled_profiles(self):
         res = self.run_cmd(["nmcli", "connection", "show", "--active"])
         return [l.split(" ")[0] for l in res.stdout.split("\n") if "wireguard" in l]
 
@@ -221,8 +221,8 @@ class Wireguard():
         logger.info(f"Deactivated profile: {profile}")
         self.notify("Deactivated profile", profile)
 
-    def disable_all_active_profiles(self, whitelist: Optional[list[str]]=None):
-        for active in self.get_active_profiles():
+    def disable_all_enabled_profiles(self, whitelist: Optional[list[str]]=None):
+        for active in self.get_enabled_profiles():
             if not whitelist or not active in whitelist:
                 self.disable_profile(active)
 
@@ -241,16 +241,20 @@ class App(Wireguard):
 
     def parse_args(self):
         parser = argparse.ArgumentParser(description="Manage wireguard connections")
-        parser.add_argument('-t', '--rofi-theme', help="Rofi theme", metavar="THEME", type=str)
+        parser.add_argument('-T', '--rofi-theme', help="Rofi theme", metavar="THEME", type=str)
+        parser.add_argument('-t', '--toggle', help="Toggle last selected profile", action="store_true")
         parser.add_argument('-H', '--history-path', help="Path to history file, default=~/.config/rofi_wireguard.history", metavar="FILE", type=Path, default=Path.home() / ".config/rofi_wireguard.history")
         parser.add_argument('-m', '--max-history', help="Maximum amount of history items, default=5", metavar="AMOUNT", type=int, default=5)
-        parser.add_argument('-n', '--notify_ms',  help="duration of notification in sec (-1 to disable), default=10", type=int, default=10)
+        parser.add_argument('-n', '--notify-ms',  help="Duration of notification in sec (-1 to disable), default=10", type=int, default=10)
+        parser.add_argument('-d', '--disable-all',  help="Disable all profiles", action="store_true")
         parser.add_argument('-D', '--debug', help="Enable debugging", action='store_true')
         args = parser.parse_args()
 
         self._rofi_theme = args.rofi_theme
         self._path_history = args.history_path
         self._max_history = args.max_history
+        self._disable_all = args.disable_all
+        self._toggle = args.toggle
 
         if args.notify_ms < 0:
             self._t_notify_ms = -1
@@ -273,7 +277,7 @@ class App(Wireguard):
 
     def add_active(self, rofi: Rofi):
         """ Add active profiles to rofi """
-        if profiles := self.get_active_profiles():
+        if profiles := self.get_enabled_profiles():
             for profile in profiles:
                 rofi.add(f"Active: {profile}", None)
         else:
@@ -302,11 +306,19 @@ class App(Wireguard):
     def handle_selected(self, profile: str):
         """ !! First activate and then deactivate all other """
         self.enable_profile(profile)
-        self.disable_all_active_profiles(whitelist=[profile])
+        self.disable_all_enabled_profiles(whitelist=[profile])
         self._history.write(profile)
 
-    def run(self):
-        wg_confs = self.get_profiles()
+    def toggle_profile(self):
+        """ Toggle between last item from history """
+        if self.get_enabled_profiles():
+            self.disable_all_enabled_profiles()
+        else:
+            if history := self._history.read():
+                self.enable_profile(history[-1])
+
+    def run_dmenu(self):
+        profiles = self.get_profiles()
 
         while True:
             rofi = Rofi(theme=self._rofi_theme)
@@ -314,21 +326,30 @@ class App(Wireguard):
             self.add_active(rofi)
             rofi.add(DISABLE_ALL_STR, DISABLE_ALL_STR)
             self.add_history(rofi)
-            self.add_countries(rofi, wg_confs.keys())
+            self.add_countries(rofi, profiles.keys())
 
             if not (res := rofi.show()):
                 return
 
             if res == DISABLE_ALL_STR:
-                self.disable_all_active_profiles()
+                self.disable_all_enabled_profiles()
                 return
             elif res in self._history.read():
                 self.handle_selected(res)
                 break
-            elif res in wg_confs.keys():
-                if selected_profile := self.select_profile(wg_confs[res]):
+            elif res in profiles.keys():
+                if selected_profile := self.select_profile(profiles[res]):
                     self.handle_selected(selected_profile)
                     break
+
+    def run(self):
+        if self._disable_all:
+            self.disable_all_enabled_profiles()
+        elif self._toggle:
+            self.toggle_profile()
+        else:
+            self.run_dmenu()
+
 
 
 logger = logging.getLogger("rofi_mullvad")
