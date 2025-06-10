@@ -1,17 +1,23 @@
 ## rofi_mullvad
 
-This script assumes you downlaoded the mullvad wireguard profiles from their official website.  
+This script assumes you downloaded the mullvad wireguard profiles from their official website.  
 Generate the wireguard profiles here: https://mullvad.net/en/account/wireguard-config?platform=linux  
 
 Install all profiles in networkmanager:
 
-    for FILE in /path/to/profiles/*.conf ; do nmcli connection import type wireguard file "$FILE" ; done
+    # All 500+ profiles are set to autoconnect on import by default so we need to disable them
+    for FILE in /path/to/profiles/*.conf ; do
+        nmcli connection import type wireguard file "$FILE"
+        nmcli connection modify "$(basename $FILE|cut -d'.' -f1)" +connection.autoconnect "no"
+        echo "Disabled autoconnect for: $FILE"
+        nmcli connection down "$(basename $FILE|cut -d'.' -f1)"
+        echo "\n"
+    done
 
-    # For some reason nmcli thinks it's a good idea to enable a profile on import so now we have to
-    # disable all 500+ imported profiles.
+Delete all (not only the just imported) wireguard profiles
 
-    for FILE in $(nmcli connection show | grep wireguard | awk '{print $1}') ; do 
-        nmcli connection down  $(basename $FILE|cut -d'.' -f1 )
+    for PROFILE in $(nmcli connection show | grep wireguard | awk '{print $1}') ; do 
+        nmcli connection delete "$PROFILE"
     done
 
 Now just run the script:
