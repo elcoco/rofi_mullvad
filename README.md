@@ -14,12 +14,12 @@ Install all profiles in networkmanager:
         echo "\n"
     done
 
-Delete all (not only the just imported) wireguard profiles
+To delete all (not only the just imported) wireguard profiles
 
     for PROFILE in $(nmcli connection show | grep wireguard | awk '{print $1}') ; do 
         nmcli connection delete "$PROFILE"
     done
 
-Now just run the script:
+Run the script:
 
     $ ./rofi_mullvad
