@@ -13,6 +13,13 @@ DISABLE_ALL_STR = "Disable All"
 """ Script assumes that the wireguard profile names begin with a country code.
     This is the case with the mullvad profiles. """
 
+# TODO: optional close after profile select
+# TODO: use wg-quick
+# TODO: download/update profiles to $XDG_CONFIG_DIR/rofi_mullvad/$COUNTRY/profile.conf
+#       put all other profiles in other sub directories
+#       No parsing required after initial download of profiles
+# TODO: History is just a subdir with symlinks to the profile, at startup we have to check
+#       if a link is dead
 
 class MullvadException(Exception): pass
 
@@ -143,7 +150,54 @@ class History():
         self._path.write_text("\n".join(history[-self._limit:]))
 
 
-class Wireguard():
+class Profile():
+    """ This will be the profile class when moving over to wg-quick """
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def run_cmd(self, cmd: list[str], timeout: int=-1, user: Optional[str]=None, envs: Optional[dict[str,str]]=None, cwd: Optional[Path]=None, raise_on_err=True, shell: bool=False):
+        # this fixes all sort of localisation issues like ',' for '.' in numbers
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+
+        if envs:
+            for k,v in envs.items():
+                env[k] = v
+
+        if user:
+            cmd = ["sudo", "-u", user] + cmd
+
+        # raises FileNotFoundError if command is not found
+        try:
+            if timeout > 0:
+                result = subprocess.run(cmd, capture_output=True, encoding="utf8", env=env, cwd=cwd, timeout=timeout, shell=shell)
+            else:
+                result = subprocess.run(cmd, capture_output=True, encoding="utf8", env=env, cwd=cwd, shell=shell)
+
+        except subprocess.TimeoutExpired as e:
+            raise MullvadException(e)
+        except FileNotFoundError as e:
+            raise MullvadException(e)
+
+        # raises subprocess.CalledProcessError if exitcode is not 0
+        try:
+            result.check_returncode()
+        except subprocess.CalledProcessError as e:
+            logger.debug(result.stdout)
+            logger.debug(result.stderr)
+            if raise_on_err:
+                raise MullvadException(e)
+
+        return result
+
+    def toggle(self):
+        ...
+
+    def is_enabled(self):
+        res = self.run_cmd(["nmcli", "connection", "show", "--active"])
+
+
+class WGNetworkManager():
     def run_cmd(self, cmd: list[str], timeout: int=-1, user: Optional[str]=None, envs: Optional[dict[str,str]]=None, cwd: Optional[Path]=None, raise_on_err=True, shell: bool=False):
         # this fixes all sort of localisation issues like ',' for '.' in numbers
         env = os.environ.copy()
@@ -233,7 +287,7 @@ class Wireguard():
         self.notify("Activated profile", profile)
 
 
-class App(Wireguard):
+class App(WGNetworkManager):
     def __init__(self) -> None:
         self.parse_args()
         self._history = History(self._path_history, self._max_history)
@@ -278,8 +332,9 @@ class App(Wireguard):
     def add_active(self, rofi: Rofi):
         """ Add active profiles to rofi """
         if profiles := self.get_enabled_profiles():
+            rofi.add_divider(text="active")
             for profile in profiles:
-                rofi.add(f"Active: {profile}", None)
+                rofi.add(f"{profile}", None)
         else:
             rofi.add(f"No active profiles", None)
 
@@ -303,19 +358,21 @@ class App(Wireguard):
             return
         return selected_profile
 
-    def handle_selected(self, profile: str):
-        """ !! First activate and then deactivate all other """
-        self.enable_profile(profile)
-        self.disable_all_enabled_profiles(whitelist=[profile])
-        self._history.write(profile)
-
-    def toggle_profile(self):
-        """ Toggle between last item from history """
-        if self.get_enabled_profiles():
-            self.disable_all_enabled_profiles()
+    def toggle_profile(self, profile: Optional[str]=None):
+        """ Toggle profile or default to toggle all previous profiles """
+        if profile:
+            if profile in self.get_enabled_profiles():
+                print(f"disable {profile}")
+                self.disable_profile(profile)
+            else:
+                print(f"enable {profile}")
+                self.enable_profile(profile)
         else:
-            if history := self._history.read():
-                self.enable_profile(history[-1])
+            if self.get_enabled_profiles():
+                self.disable_all_enabled_profiles()
+            else:
+                if history := self._history.read():
+                    self.enable_profile(history[-1])
 
     def run_dmenu(self):
         profiles = self.get_profiles()
@@ -334,13 +391,15 @@ class App(Wireguard):
             if res == DISABLE_ALL_STR:
                 self.disable_all_enabled_profiles()
                 return
-            elif res in self._history.read():
-                self.handle_selected(res)
-                break
+            elif res in self._history.read() or res in self.get_enabled_profiles():
+                self.toggle_profile(res)
+                self._history.write(res)
+                #break
             elif res in profiles.keys():
                 if selected_profile := self.select_profile(profiles[res]):
-                    self.handle_selected(selected_profile)
-                    break
+                    self.toggle_profile(selected_profile)
+                    self._history.write(selected_profile)
+                    #break
 
     def run(self):
         if self._disable_all:
