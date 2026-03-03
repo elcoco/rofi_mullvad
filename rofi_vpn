@@ -422,8 +422,8 @@ class App():
     def parse_args(self):
         parser = argparse.ArgumentParser(description="Manage wireguard connections")
         parser.add_argument('-r', '--rofi-theme', help="Rofi theme", metavar="THEME", type=str)
-        parser.add_argument('-t', '--toggle-last', help="Toggle last selected profile", action="store_true")
-        parser.add_argument('-T', '--toggle', help="Toggle profile")
+        parser.add_argument('-T', '--toggle-last', help="Toggle last selected profile", action="store_true")
+        parser.add_argument('-t', '--toggle', help="Toggle profile")
         parser.add_argument('-m', '--max-history', help="Maximum amount of history items, default=5", metavar="AMOUNT", type=int, default=5)
         parser.add_argument('-n', '--notify-ms',  help="Duration of notification in sec (-1 to disable), default=10", type=int, default=10)
         parser.add_argument('-d', '--disable-all',  help="Disable all profiles", action="store_true")
@@ -507,8 +507,11 @@ class App():
         while True:
             rofi = Rofi(theme=self._rofi_theme)
 
-            for server in wireguard.get_active():
-                rofi.add(str(server), server)
+            if active := wireguard.get_active():
+                for server in active:
+                    rofi.add(str(server), server)
+            else:
+                rofi.add("No active profiles", None)
 
             if self._history_dir.is_dir():
                 rofi.add_divider(text="history")
