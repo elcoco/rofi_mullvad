@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from typing import Optional, Any
+from typing import Any
 import subprocess
 import os
 from pathlib import Path
@@ -9,44 +9,30 @@ import argparse
 import json
 import re
 import shutil
-
 import urllib.request
 
-DISABLE_ALL_STR = "> Disable All"
-UPDATE_MULLVAD_STR = "> Update Mullvad"
-
-MULLVAD_SERVER_LIST_EP = "https://api.mullvad.net/www/relays/all/"
-PRIVATE_KEY=(Path.home() / "mullvad_priv_key.key").read_text().strip()
-
-""" Script assumes that the wireguard profile names begin with a country code.
-    This is the case with the mullvad profiles. """
-
-# TODO: optional close after profile select
-# TODO: use wg-quick
-# TODO: download/update profiles to $XDG_CONFIG_DIR/rofi_mullvad/$COUNTRY/profile.conf
-#       put all other profiles in other sub directories
-#       No parsing required after initial download of profiles
-# TODO: History is just a subdir with symlinks to the profile, at startup we have to check
-#       if a link is dead
-
-COUNTRY_CODES_PATH = Path(os.path.dirname(__file__)) / "country_codes.json"
+MENU_DISABLE_ALL_STR = "* Disable All"
+MENU_UPDATE_MULLVAD_STR = "* Update Mullvad"
 
 WG_PROFILE_BASE_DIR = Path.home() / ".config/rofi_mullvad/profiles"
+HISTORY_DIR = WG_PROFILE_BASE_DIR / "history"
+
+MULLVAD_SERVER_LIST_EP = "https://api.mullvad.net/www/relays/all"
 MULLVAD_BASEDIR = WG_PROFILE_BASE_DIR / "mullvad"
+MULLVAD_TEMPLATE = ("[Interface]\n"
+                    "PrivateKey = {priv_key}\n"
+                    "Address = 10.68.217.186/32,fc00:bbbb:bbbb:bb01::5:d9b9/128\n"
+                    "DNS = 10.64.0.1\n"
+                    "\n"
+                    "[Peer]\n"
+                    "PublicKey = {pub_key}\n"
+                    "AllowedIPs = 0.0.0.0/0,::0/0\n"
+                    "Endpoint = {ipv4_addr_in}:51820\n")
 
-WG_HISTORY_DIR = WG_PROFILE_BASE_DIR / "history"
-WG_TEMPLATE = ("[Interface]\n"
-               "PrivateKey = {priv_key}\n"
-               "Address = 10.68.217.186/32,fc00:bbbb:bbbb:bb01::5:d9b9/128\n"
-               "DNS = 10.64.0.1\n"
-               "\n"
-               "[Peer]\n"
-               "PublicKey = {pub_key}\n"
-               "AllowedIPs = 0.0.0.0/0,::0/0\n"
-               "Endpoint = {ipv4_addr_in}:51820\n")
+CMD_TIMEOUT_SEC = 2
+NOTIFY_TIMEOUT_MS = 5000
 
-
-def run_cmd(cmd: list[str], timeout: int=-1, user: Optional[str]=None, envs_extra: Optional[dict[str,str]]=None, cwd: Optional[Path]=None) -> subprocess.CompletedProcess[str]:
+def run_cmd(cmd: list[str], timeout: int=-1, user: str|None=None, envs_extra: dict[str,str]|None=None, cwd: Path|None=None) -> subprocess.CompletedProcess[str]:
     envs = os.environ.copy()
     envs["LC_ALL"] = "C"
     if envs_extra:
@@ -74,6 +60,14 @@ def run_cmd(cmd: list[str], timeout: int=-1, user: Optional[str]=None, envs_extr
         raise MullvadException(f"Command failed with code {result.returncode}: {' '.join(cmd)}" + (f"\n{stderr}" if stderr else ""))
     return result
 
+def notify(summary: str, body: str, t_ms: int=NOTIFY_TIMEOUT_MS):
+    if t_ms >= 0:
+        try:
+            run_cmd(["notify-send", "--app-name=Mullvad", f"--expire-time={t_ms}",
+                         f"--urgency=normal", f"Mullvad: {summary}", body], timeout=CMD_TIMEOUT_SEC)
+            logger.info(f"{body}")
+        except MullvadException as e:
+            logger.error(e)
 
 def sanitize(string) -> str:
     replace_lst = { " ": "_",
@@ -246,7 +240,7 @@ class Server():
             raise MullvadException(f"Failed to read profile, missing key for {path}: {e}")
 
     def to_profile(self):
-        return WG_TEMPLATE.format(priv_key     = self.priv_key,
+        return MULLVAD_TEMPLATE.format(priv_key     = self.priv_key,
                                   pub_key      = self.peer_pub_key,
                                   ipv4_addr_in = self.ipv4_addr_in)
 
@@ -282,30 +276,20 @@ class Server():
         except (FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
             raise MullvadException(e)
 
-    def notify(self, summary: str, body: str, t_ms: int=10000):
-        if t_ms >= 0:
-            try:
-                run_cmd(["notify-send", "--app-name=Mullvad", f"--expire-time={t_ms}",
-                             f"--urgency=normal", f"Mullvad: {summary}", body])
-            except MullvadException as e:
-                logger.error(e)
-
     def is_active(self) -> bool:
         try:
-            run_cmd(["sudo", "wg", "show", self.hostname])
+            run_cmd(["sudo", "wg", "show", self.hostname], timeout=CMD_TIMEOUT_SEC)
             return True
         except MullvadException as e:
             return False
 
     def activate(self):
-        run_cmd(["sudo", "wg-quick", "up", str(self.path)])
-        logger.info(f"Activating: {self.hostname}")
-        self.notify("Activated profile", self.hostname)
+        run_cmd(["sudo", "wg-quick", "up", str(self.path)], timeout=CMD_TIMEOUT_SEC)
+        notify("Activate", f"Activating: {self.hostname}")
 
     def deactivate(self):
-        run_cmd(["sudo", "wg-quick", "down", str(self.path)])
-        logger.info(f"Deactivating: {self.hostname}")
-        self.notify("Deactivated profile", self.hostname)
+        run_cmd(["sudo", "wg-quick", "down", str(self.path)], timeout=CMD_TIMEOUT_SEC)
+        notify("Deactivate", f"Deactivating: {self.hostname}")
 
     def toggle(self):
         if self.is_active():
@@ -320,11 +304,12 @@ class Mullvad():
         self._base_dir = base_dir
 
     def req_mullvad_server_list(self, url: str=MULLVAD_SERVER_LIST_EP, timeout: int=10):
+        """ Request server list and create server objects """
         if not self._private_key:
             raise MullvadException(f"No key specified")
 
         req = urllib.request.Request(
-            MULLVAD_SERVER_LIST_EP,
+            url,
             headers={"Content-Type": "application/json"},
             method="GET"
         )
@@ -351,20 +336,23 @@ class Mullvad():
         return servers
 
     def write_server_list(self):
-        """ Download serverlist, create profiles and write to {base_dir} """
+        """ Request serverlist, create profiles and write to {base_dir} """
         if not self._private_key:
             raise MullvadException(f"No key specified")
 
         try:
-            shutil.rmtree(self._base_dir, ignore_errors=True)
+            shutil.rmtree(self._base_dir)
             logger.debug(f"Removed:{self._base_dir}")
-        except (FileNotFoundError, PermissionError) as e:
+        except FileNotFoundError:
+            ...
+        except PermissionError as e:
             raise MullvadException(f"Failed to remove {self._base_dir}: {e}")
 
-        for server in self.req_mullvad_server_list():
+        servers = self.req_mullvad_server_list()
+        for server in servers:
             server.write()
 
-        logger.info(f"Wrote mullvad server list to:{self._base_dir}")
+        notify("Update", f"Wrote {len(servers)} mullvad profiles to: {self._base_dir}")
 
 
 class Wireguard():
@@ -373,23 +361,22 @@ class Wireguard():
         self._ignore_dirs = ignore_dirs or []
 
     def rec_read_servers(self) -> list[Server]:
-        """ Recursively read mullvad profiles from filesystem """
+        """ Recursively read profiles from filesystem """
         servers: list[Server] = []
         for p in self._base_dir.rglob("*.conf"):
-            for d in self._ignore_dirs:
-                if d in p.parents:
-                    continue
+            if any(d in p.parents for d in self._ignore_dirs):
+                continue
             servers.append(Server.from_path(p))
         return servers
 
     def read_servers(self) -> list[Server|Path]:
-        """ Read profiles from filesystem one level deep """
+        """ Read profiles and subdirs from filesystem one level deep, profiles first """
         dirs = []
         servers = []
         for p in self._base_dir.iterdir():
             if p.is_dir():
                 dirs.append(p)
-            if p.is_file() and p.name.endswith(".conf"):
+            elif p.is_file() and p.name.endswith(".conf"):
                 servers.append(Server.from_path(p))
         return servers + sorted(dirs, key=lambda x: x.name)
 
@@ -403,7 +390,7 @@ class Wireguard():
     def get_active(self):
         """ Get all active Server objects """
         servers: list[Server] = []
-        result = run_cmd(["sudo", "wg", "show", "interfaces"])
+        result = run_cmd(["sudo", "wg", "show", "interfaces"], timeout=CMD_TIMEOUT_SEC)
         for hostname in result.stdout.split(" "):
             hostname = hostname.strip()
             if not hostname:
@@ -416,22 +403,19 @@ class Wireguard():
 
 
 class App():
-    def __init__(self) -> None:
-        self.parse_args()
-
     def parse_args(self):
         parser = argparse.ArgumentParser(description="Manage wireguard connections")
         parser.add_argument('-r', '--rofi-theme', help="Rofi theme", metavar="THEME", type=str)
         parser.add_argument('-T', '--toggle-last', help="Toggle last selected profile", action="store_true")
         parser.add_argument('-t', '--toggle', help="Toggle profile")
         parser.add_argument('-m', '--max-history', help="Maximum amount of history items, default=5", metavar="AMOUNT", type=int, default=5)
-        parser.add_argument('-n', '--notify-ms',  help="Duration of notification in sec (-1 to disable), default=10", type=int, default=10)
         parser.add_argument('-d', '--disable-all',  help="Disable all profiles", action="store_true")
         parser.add_argument('-p', '--profile-dir',  help="Profile directory", type=Path, default=WG_PROFILE_BASE_DIR)
-        parser.add_argument('-H', '--history-dir',  help="History directory", type=Path, default=WG_HISTORY_DIR)
-        parser.add_argument('-k', '--mullvad-key',  help="Mullvad private key")
+        parser.add_argument('-H', '--history-dir',  help="History directory", type=Path, default=HISTORY_DIR)
 
-        parser.add_argument('-u', '--update',  help="Update profiles", action="store_true")
+        parser.add_argument('-u', '--update-mullvad',  help="Update mullvad profiles", action="store_true")
+        parser.add_argument('-k', '--mullvad-key',  help="Mullvad private key")
+        parser.add_argument('-K', '--mullvad-key-path',  help="Mullvad private key path", type=Path)
 
         parser.add_argument('-D', '--debug', help="Enable debugging", action='store_true')
 
@@ -443,20 +427,26 @@ class App():
         self._disable_all = args.disable_all
         self._toggle_last = args.toggle_last
         self._toggle = args.toggle
-        self._update = args.update
+        self._update_mullvad = args.update_mullvad
         self._base_dir = args.profile_dir
         self._history_dir = args.history_dir
-        self._mullvad_key = args.mullvad_key
 
-        if args.notify_ms < 0:
-            self._t_notify_ms = -1
-        else:
-            self._t_notify_ms = args.notify_ms * 1000
+        self._mullvad_key = args.mullvad_key
 
         if args.debug:
             logger.setLevel(logging.DEBUG)
         else:
             logger.setLevel(logging.INFO)
+
+        if args.mullvad_key_path:
+            try:
+                self._mullvad_key = args.mullvad_key_path.read_text().strip()
+                logger.debug(f"Read key from: {args.mullvad_key_path}")
+            except (FileNotFoundError, PermissionError) as e:
+                raise MullvadException(f"Failed to read key file: {e}")
+
+        if self._update_mullvad and not self._mullvad_key:
+            raise MullvadException(f"Specify mullvad private key (-k | -K)")
 
     def get_history(self, hist_dir: Path):
         """ Get profiles from history dir and sort by ctime """
@@ -474,13 +464,13 @@ class App():
 
     def select_profile(self, src_dir: Path) -> Server|None:
         """ Select profile using rofi """
-        server: Server|None = None
-        cur_dir: Path|None = src_dir
-        prev_dir: Path|None = None
+        # Stack that tracks location, last item is current
+        path: list[Path] = [src_dir]
 
-        while not server:
+        while path:
             rofi = Rofi(theme=self._rofi_theme)
 
+            cur_dir = path.pop()
             for p in cur_dir.iterdir():
                 if p.is_dir():
                     rofi.add(f"> {p.name}", p)
@@ -489,21 +479,15 @@ class App():
                     rofi.add(str(s), s)
 
             result = rofi.show()
+
             if isinstance(result, Path) and result.is_dir():
-                prev_dir = cur_dir
-                cur_dir = result
+                path.append(cur_dir)
+                path.append(result)
             elif isinstance(result, Server):
                 logger.debug(f"Selected: {result}")
                 return result
-            else:
-                if cur_dir == src_dir:
-                    break
-                cur_dir = prev_dir
-
-        logger.debug("no match")
 
     def run_rofi(self, mullvad: Mullvad, wireguard: Wireguard):
-
         while True:
             rofi = Rofi(theme=self._rofi_theme)
 
@@ -519,8 +503,9 @@ class App():
                     rofi.add(str(server), server)
 
             rofi.add_divider()
-            rofi.add(DISABLE_ALL_STR, DISABLE_ALL_STR)
-            rofi.add(UPDATE_MULLVAD_STR, UPDATE_MULLVAD_STR)
+            rofi.add(MENU_DISABLE_ALL_STR, MENU_DISABLE_ALL_STR)
+            if self._mullvad_key:
+                rofi.add(MENU_UPDATE_MULLVAD_STR, MENU_UPDATE_MULLVAD_STR)
             rofi.add_divider()
 
             for item in wireguard.read_servers():
@@ -533,10 +518,10 @@ class App():
                 return
 
             # Handle result
-            if res == DISABLE_ALL_STR:
+            if res == MENU_DISABLE_ALL_STR:
                 for server in wireguard.get_active():
                     server.deactivate()
-            elif res == UPDATE_MULLVAD_STR:
+            elif res == MENU_UPDATE_MULLVAD_STR:
                 mullvad.write_server_list()
             elif isinstance(res, Server):
                 res.toggle()
@@ -547,13 +532,14 @@ class App():
                     server.add_to_history(self._history_dir)
 
     def run(self):
+        self.parse_args()
         mullvad = Mullvad(self._mullvad_key, MULLVAD_BASEDIR)
         wireguard = Wireguard(self._base_dir, ignore_dirs=[self._history_dir])
 
         # Remove all dangling symlinks in history dir
         self.get_history(self._history_dir)
 
-        if self._update:
+        if self._update_mullvad:
             mullvad.write_server_list()
 
         elif self._toggle:
@@ -581,4 +567,4 @@ if __name__ == "__main__":
     try:
         app.run()
     except MullvadException as e:
-        logger.error(e)
+        notify("Error", str(e))
