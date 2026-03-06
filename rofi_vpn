@@ -10,9 +10,26 @@ import json
 import re
 import shutil
 import urllib.request
+import urllib.parse
+import urllib.error
+
+"""
+ TODO: Clearly i'm using the wrong approach for getting profile addreses.
+       See: https://github.com/mullvad/mullvad-wg.sh/blob/main/mullvad-wg.sh
+
+       Method:
+
+       # Get user pubkey (not server pubkey that is in the profile)
+       wg pubkey <<<"$PRIVATE_KEY"
+
+       # Get address
+       curl -sSL https://api.mullvad.net/wg -d account=$ACCOUNT_NR --data-urlencode pubkey=$PUBKEY
+"""
+
 
 MENU_DISABLE_ALL_STR = "* Disable All"
 MENU_UPDATE_MULLVAD_STR = "* Update Mullvad"
+MENU_DIR_FORMAT = "> {item}"
 
 WG_PROFILE_BASE_DIR = Path.home() / ".config/rofi_mullvad/profiles"
 HISTORY_DIR = WG_PROFILE_BASE_DIR / "history"
@@ -21,7 +38,7 @@ MULLVAD_SERVER_LIST_EP = "https://api.mullvad.net/www/relays/all"
 MULLVAD_BASEDIR = WG_PROFILE_BASE_DIR / "mullvad"
 MULLVAD_TEMPLATE = ("[Interface]\n"
                     "PrivateKey = {priv_key}\n"
-                    "Address = 10.68.217.186/32,fc00:bbbb:bbbb:bb01::5:d9b9/128\n"
+                    "Address = {address}\n"
                     "DNS = 10.64.0.1\n"
                     "\n"
                     "[Peer]\n"
@@ -32,7 +49,7 @@ MULLVAD_TEMPLATE = ("[Interface]\n"
 CMD_TIMEOUT_SEC = 2
 NOTIFY_TIMEOUT_MS = 5000
 
-def run_cmd(cmd: list[str], timeout: int=-1, user: str|None=None, envs_extra: dict[str,str]|None=None, cwd: Path|None=None) -> subprocess.CompletedProcess[str]:
+def run_cmd(cmd: list[str], timeout: int=-1, user: str|None=None, envs_extra: dict[str,str]|None=None, cwd: Path|None=None, input_str: str|None=None) -> subprocess.CompletedProcess[str]:
     envs = os.environ.copy()
     envs["LC_ALL"] = "C"
     if envs_extra:
@@ -42,6 +59,7 @@ def run_cmd(cmd: list[str], timeout: int=-1, user: str|None=None, envs_extra: di
         result = subprocess.run(cmd,
                                 capture_output=True,
                                 text=True,
+                                input=input_str,
                                 timeout=timeout if timeout > 0 else None,
                                 user=user,
                                 env=envs,
@@ -190,8 +208,9 @@ class Rofi():
 
 
 class Server():
-    def __init__(self, hostname: str, priv_key: str, ipv4_addr_in: str, ipv6_addr_in: str|None, peer_pub_key: str, path: Path):
+    def __init__(self, hostname: str, address: str, priv_key: str, ipv4_addr_in: str, ipv6_addr_in: str|None, peer_pub_key: str, path: Path):
         self.hostname: str = hostname
+        self.address: str = address
         self.priv_key: str = priv_key
         self.ipv4_addr_in: str = ipv4_addr_in
         self.ipv6_addr_in: str|None = ipv6_addr_in
@@ -202,19 +221,18 @@ class Server():
         return f"{self.hostname}"
 
     @classmethod
-    def from_json(cls, js: dict, private_key: str, base_dir: Path) -> 'Server':
+    def from_json(cls, js: dict, private_key: str, address: str, base_dir: Path) -> 'Server':
         """ Initialize from json """
         try:
             return cls(js["hostname"],
-                       #js["country_name"],
-                       #js["country_code"],
+                       address,
                        private_key,
                        js["ipv4_addr_in"],
                        js["ipv6_addr_in"],
                        js["pubkey"],
                        base_dir / sanitize(js["country_name"]) / f"{js['hostname']}.conf")
         except KeyError as e:
-            raise MullvadException(f"Missing key: {e} in\n{json.dumps(js, indent=4)}")
+            raise MullvadException(f"Failed to parse json, Missing key: '{e}' in\n{json.dumps(js, indent=4)}")
 
     @classmethod
     def from_path(cls, path: Path) -> 'Server':
@@ -226,10 +244,10 @@ class Server():
             priv_key = re.search(r"^PrivateKey = (.*)$", data, re.MULTILINE).group(1)
             pub_key = re.search(r"^PublicKey = (.*)$", data, re.MULTILINE).group(1)
             ipv4_addr_in = re.search(r"^Endpoint = (.*):\d+$", data, re.MULTILINE).group(1)
+            address = re.search(r"^Address = (.*)$", data, re.MULTILINE).group(1)
 
             return cls(path.stem,
-                       #"country name",
-                       #country_code,
+                       address,
                        priv_key,
                        ipv4_addr_in,
                        None,
@@ -237,12 +255,13 @@ class Server():
                        path)
 
         except AttributeError as e:
-            raise MullvadException(f"Failed to read profile, missing key for {path}: {e}")
+            raise MullvadException(f"Failed to parse {path}, {e}")
 
     def to_profile(self):
         return MULLVAD_TEMPLATE.format(priv_key     = self.priv_key,
-                                  pub_key      = self.peer_pub_key,
-                                  ipv4_addr_in = self.ipv4_addr_in)
+                                       pub_key      = self.peer_pub_key,
+                                       address      = self.address,
+                                       ipv4_addr_in = self.ipv4_addr_in)
 
     def write(self, base_dir: Path|None=None):
         """ Write profile to path """
@@ -299,14 +318,17 @@ class Server():
 
 
 class Mullvad():
-    def __init__(self, private_key: str, base_dir: Path):
+    def __init__(self, private_key: str, account: int, base_dir: Path):
         self._private_key = private_key
         self._base_dir = base_dir
+        self._account = account
 
     def req_mullvad_server_list(self, url: str=MULLVAD_SERVER_LIST_EP, timeout: int=10):
         """ Request server list and create server objects """
         if not self._private_key:
             raise MullvadException(f"No key specified")
+
+        address = self.req_mullvad_address()
 
         req = urllib.request.Request(
             url,
@@ -331,9 +353,51 @@ class Mullvad():
         for server_js in js:
             if server_js["type"] != "wireguard":
                 continue
-            servers.append(Server.from_json(server_js, self._private_key, self._base_dir))
+            servers.append(Server.from_json(server_js, self._private_key, address, self._base_dir))
 
         return servers
+
+    def req_mullvad_address(self, timeout: int=10):
+        """ Fetch mullvad address from account number and pubkey """
+        if not self._private_key:
+            raise MullvadException(f"No key specified")
+        if not self._account:
+            raise MullvadException(f"No account number specified")
+
+        data = urllib.parse.urlencode({
+            "account": self._account,
+            "pubkey": self.get_user_pubkey()
+        }).encode()
+
+        req = urllib.request.Request(
+            f"https://api.mullvad.net/wg",
+            data = data,
+            method="POST"
+        )
+        logger.debug(f"Requesting address for pubkey: '{self.get_user_pubkey()}'")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    raise MullvadException(f"{req.full_url}, {resp.status}, {resp.reason}, {resp.headers}")
+                if not (address := resp.read().decode('utf-8')):
+                    raise MullvadException(f"Failed to receive address from mulvad")
+                logger.debug(f"Received mullvad address: '{address}'")
+                return address
+        except urllib.error.HTTPError as e:
+            raise MullvadException(f"HTTP error: {e.code} {e.reason}")
+        except urllib.error.URLError as e:
+            raise MullvadException(f"URL error: {e.reason}")
+        except json.JSONDecodeError as e:
+            raise MullvadException(f"Invalid JSON response: {e}")
+        except Exception as e:
+            raise MullvadException(f"Unexpected error: {e}")
+
+    def get_user_pubkey(self) -> str:
+        """ Get user pubkey by private key """
+        if not self._private_key:
+            raise MullvadException(f"No key specified")
+        result = run_cmd(["sudo", "wg", "pubkey"], timeout=CMD_TIMEOUT_SEC, input_str=self._private_key)
+        return result.stdout.strip()
 
     def write_server_list(self):
         """ Request serverlist, create profiles and write to {base_dir} """
@@ -416,6 +480,7 @@ class App():
         parser.add_argument('-u', '--update-mullvad',  help="Update mullvad profiles", action="store_true")
         parser.add_argument('-k', '--mullvad-key',  help="Mullvad private key")
         parser.add_argument('-K', '--mullvad-key-path',  help="Mullvad private key path", type=Path)
+        parser.add_argument('-a', '--mullvad-account',  help="Mullvad account number", type=int)
 
         parser.add_argument('-D', '--debug', help="Enable debugging", action='store_true')
 
@@ -432,6 +497,7 @@ class App():
         self._history_dir = args.history_dir
 
         self._mullvad_key = args.mullvad_key
+        self._mullvad_account = args.mullvad_account
 
         if args.debug:
             logger.setLevel(logging.DEBUG)
@@ -445,8 +511,11 @@ class App():
             except (FileNotFoundError, PermissionError) as e:
                 raise MullvadException(f"Failed to read key file: {e}")
 
-        if self._update_mullvad and not self._mullvad_key:
-            raise MullvadException(f"Specify mullvad private key (-k | -K)")
+        if self._update_mullvad:
+            if not self._mullvad_key:
+                raise MullvadException(f"Specify mullvad private key (-k | -K)")
+            if not self._mullvad_account:
+                raise MullvadException(f"Specify mullvad account number (-a)")
 
     def get_history(self, hist_dir: Path):
         """ Get profiles from history dir and sort by ctime """
@@ -473,7 +542,7 @@ class App():
             cur_dir = path.pop()
             for p in cur_dir.iterdir():
                 if p.is_dir():
-                    rofi.add(f"> {p.name}", p)
+                    rofi.add(MENU_DIR_FORMAT.format(item=p.name), p)
                 if p.name.endswith(".conf"):
                     s = Server.from_path(p)
                     rofi.add(str(s), s)
@@ -512,7 +581,7 @@ class App():
                 if isinstance(item, Server):
                     rofi.add(item.hostname, item)
                 elif isinstance(item, Path) and not item == self._history_dir:
-                    rofi.add(f"> {item.name}", item)
+                    rofi.add(MENU_DIR_FORMAT.format(item=item.name), item)
 
             if not (res := rofi.show()):
                 return
@@ -533,7 +602,7 @@ class App():
 
     def run(self):
         self.parse_args()
-        mullvad = Mullvad(self._mullvad_key, MULLVAD_BASEDIR)
+        mullvad = Mullvad(self._mullvad_key, self._mullvad_account, MULLVAD_BASEDIR)
         wireguard = Wireguard(self._base_dir, ignore_dirs=[self._history_dir])
 
         # Remove all dangling symlinks in history dir
